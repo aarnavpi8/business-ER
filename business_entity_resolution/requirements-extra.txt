@@ -1,0 +1,9 @@
+# Optional accelerators (install on the machines you run on; code falls back without them).
+# After the final run, replace this with `pip freeze > requirements-lock.txt` from that machine.
+rapidfuzz>=3.6        # MIT   - vectorised fuzzy string metrics (big speed-up for string features)
+lightgbm>=4.3         # MIT   - fast GBDT
+xgboost>=2.0          # Apache-2.0 - GBDT with CUDA
+torch>=2.2            # BSD   - GPU (CUDA / Apple MPS) top-k search and embeddings
+sentence-transformers>=3.0   # Apache-2.0 - optional embedding view
+# embedding models allowed by the rules (MIT/Apache, <= 8B):
+#   intfloat/multilingual-e5-small (MIT), sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 (Apache-2.0)

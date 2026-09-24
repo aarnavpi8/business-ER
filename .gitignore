@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# regenerable pipeline artifacts
+business_entity_resolution/cache/
+business_entity_resolution/fake_cache/
+business_entity_resolution/fake_output/
+business_entity_resolution/fake_dataset/
+
+# competition data (large; re-download from the portal)
+business_entity_resolution/dataset/
