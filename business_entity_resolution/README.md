@@ -1,51 +1,51 @@
 # Business Entity Resolution — Amazon ML Challenge 2026
 
-Pipeline: **data → normalisation → blocking → stage-1 prune → stage-2 match → per-entity decoding → output**.
+Per country: **normalise → block (GPU dense search) → stage-1 prune → stage-2 match → per-record decision → output**.
 
-Core dependencies: numpy / pandas / scipy / scikit-learn (`requirements.txt`).
-Optional accelerators, auto-detected (`requirements-extra.txt`): rapidfuzz, lightgbm, xgboost,
-torch (CUDA or Apple MPS), sentence-transformers. No external data or lookups.
+## What the data told us (train, 2.2M S1 / 10.3M S2+S3)
+- Every S2/S3 record belongs to **at most one** S1 entity (7.6M links, 0 exceptions) and
+  **no link crosses countries** → blocking is done within each country label, and the final
+  decision is made per S2/S3 record: "best S1 candidate, if p ≥ t".
+- Only 5.6% of S1 are singletons; 3.5 matches per S1 on average (both sources contain duplicates).
+- 23% of Indian S2 names (12% S3) are in native scripts (Devanagari, Telugu, Kannada, Tamil,
+  Bengali, Gujarati, Malayalam, Oriya, Gurmukhi) → `translit.py` romanises them.
+- ~3–4% of true pairs share no name (trade names) → an address-only search view.
 
 ## Layout
-
 ```
 src/
-  normalize.py        text cleaning, legal-suffix & abbreviation handling (multilingual)
-  sims.py             pure-Python string similarity fallbacks
-  data.py             TSV loading (explicit tab separator), normalised fields, train subsampling
-  search.py           encoders (TF-IDF+SVD / sentence-transformers) and exact GPU/CPU top-k search
-  blocking.py         multi-view candidate generation in both directions + reverse-best stats
-  features.py         cheap (stage-1) and string (stage-2) pair features
-  models.py           GBDT wrapper: lightgbm | xgboost (CUDA) | sklearn fallback
-  select_matches.py   decoders: threshold / expected-F0.5 per entity, optional one-to-one
+  translit.py         Indic-script romanisation from Unicode names (no external data)
+  normalize.py        names / addresses: suffixes, abbreviations, states, numbers, junk
+  data.py             TSV loading, parallel normalisation, prepared-frame cache
+  search.py           TF-IDF -> random projection encoder; exact top-k (torch CUDA/MPS or numpy)
+  blocking.py         per-country 3-view search in both directions (+ best/second stats)
+  features.py         chunked cheap features, string features (rapidfuzz or python), stacking
+  models.py           GBDT wrapper: lightgbm | xgboost | sklearn
   metric.py           official macro F0.5
-  pipeline.py         CLI
+  pipeline.py         CLI (train CV + test prediction)
   check_submission.py local copy of the submission rules
+  sims.py             pure-Python string similarity fallbacks
   make_fake_data.py   synthetic data generator (dev only)
+notebooks/            01 EDA, 02 blocking, 03 error analysis, 04 alias mining (read pipeline cache)
 ```
 
 ## Reproduce
-
 ```bash
-pip install -r requirements.txt            # + optionally: pip install -r requirements-extra.txt
-# data at ./dataset/{train,test}/...
+pip install -r requirements.txt          # + rapidfuzz lightgbm (strongly recommended), torch with CUDA
+# DATA = folder containing train/ and test/, e.g. ../6ab10eb3b23ba_student_resource/student_resource/dataset
 
-# CV on train (blocking recall, pruning recall, OOF F0.5, decoder tuning, country holdout),
-# then train final models and write output/matching_results.tsv + output/candidate_pairs.tsv
-python src/pipeline.py run --data dataset --out output
+# CV only (fast iteration): blocking recall, pruning recall, OOF F0.5, threshold tuning
+python src/pipeline.py run --data DATA --cache cache --no-test --frac 0.05
 
-# quick experiment on 20% of train, no test prediction
-python src/pipeline.py run --data dataset --frac 0.2 --no-test
+# full: CV + final models + test prediction -> output/matching_results.tsv, output/candidate_pairs.tsv
+python src/pipeline.py run --data DATA --cache cache --out output --frac 0.1
 
-# add a multilingual embedding view to blocking (GPU recommended)
-python src/pipeline.py run --data dataset --emb st:intfloat/multilingual-e5-small
-
-python src/check_submission.py --matching output/matching_results.tsv \
-    --candidate output/candidate_pairs.tsv --test-dir dataset/test
+python src/check_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir DATA/test
 ```
+Blocking and normalised frames are cached in `--cache` (delete the `block_*.npz` / `prep_*.pkl`
+files after changing normalisation or blocking code).
 
-Useful flags: `--M` (candidates kept per S1 after stage 1, default 15), `--k-scale` (blocking
-breadth), `--same-country`, `--backend lgbm|xgb|hgb`, `--n-est`, `--folds`, `--chunk-s1`.
-Env: `BER_NO_TORCH=1`, `BER_NO_RAPIDFUZZ=1` force the fallbacks.
-
-Dev without real data: `python src/make_fake_data.py --out fake_dataset` then `--data fake_dataset`.
+Useful flags: `--frac` (share of train S1 used to train the models), `--M` (S1 candidates kept per
+S2/S3 record after stage 1, default 3), `--k-scale` (search depth), `--dim` (projection size,
+default 256), `--train-countries us` (train on one country to test generalisation),
+`--backend lgbm|xgb|hgb`, `--n-est`, `--chunk-rows`.

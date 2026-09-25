@@ -3,7 +3,7 @@ import os
 import pandas as pd
 
 from normalize import (normalize_name, core_name, name_acronym, normalize_address,
-                       address_numbers, postcode, basic_clean)
+                       address_numbers, first_number, address_words, basic_clean)
 
 COLS = ["entity_id", "business_name", "business_address", "country"]
 
@@ -38,23 +38,58 @@ def load_ground_truth(data_dir: str) -> dict:
     return out
 
 
-def prepare(df: pd.DataFrame) -> pd.DataFrame:
-    """Add normalised name/address fields and parsed address components."""
-    df = df.copy().reset_index(drop=True)
+def _norm_chunk(args):
+    """Worker: normalise one chunk of (name, address, country) lists."""
+    names, addrs, countries = args
+    nn = [normalize_name(x) for x in names]
+    return dict(name_n=nn, name_core=[core_name(x) for x in nn],
+                addr_n=[normalize_address(x) for x in addrs],
+                country_n=[basic_clean(x) for x in countries])
+
+
+KEEP = ["entity_id", "src", "country_n", "name_n", "name_core", "addr_n"]
+
+
+def prepare(df: pd.DataFrame, n_jobs=None, chunk=100_000, slim=True) -> pd.DataFrame:
+    """Add normalised name/address/country columns (parallel for large frames).
+
+    slim=True keeps only the columns the pipeline needs (memory: ~10M rows per
+    split); everything else (acronyms, number sets, ...) is derived on the fly.
+    """
+    import multiprocessing as mp
+    df = df.reset_index(drop=True)
     for c in COLS:
         if c not in df.columns:
             df[c] = ""
-    df["name_n"] = df["business_name"].map(normalize_name)
-    df["name_core"] = df["name_n"].map(core_name)
-    df["name_acr"] = df["name_core"].map(name_acronym)
-    df["addr_n"] = df["business_address"].map(normalize_address)
-    df["addr_nums"] = df["addr_n"].map(address_numbers)
-    df["pcode"] = df["business_address"].map(postcode)
-    df["country_n"] = df["country"].map(basic_clean)
-    df["full_n"] = (df["name_core"] + " | " + df["addr_n"]).str.strip()
-    # raw-ish text for multilingual embedding models (keeps accents / casing)
-    df["emb_text"] = (df["business_name"].astype(str) + ", " + df["business_address"].astype(str)).str.strip(", ")
+    cols = [df["business_name"].tolist(), df["business_address"].tolist(), df["country"].tolist()]
+    tasks = [tuple(c[i:i + chunk] for c in cols) for i in range(0, len(df), chunk)]
+    n_jobs = n_jobs or max(1, (os.cpu_count() or 2) - 1)
+    if len(tasks) > 1 and n_jobs > 1:
+        with mp.get_context("spawn").Pool(min(n_jobs, len(tasks))) as pool:
+            parts = pool.map(_norm_chunk, tasks)
+    else:
+        parts = [_norm_chunk(t) for t in tasks]
+    for k in parts[0]:
+        df[k] = [x for p in parts for x in p[k]]
+    if slim:
+        df = df[KEEP].copy()
     return df
+
+
+def load_prepared(data_dir: str, split: str, cache_dir: str = None):
+    """load_split with an on-disk pickle cache of the normalised frames."""
+    import pickle
+    if cache_dir:
+        path = os.path.join(cache_dir, f"prep_{split}.pkl")
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return pickle.load(f)
+    s1, s23 = load_split(data_dir, split)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump((s1, s23), f, protocol=4)
+    return s1, s23
 
 
 def subsample(s1, s23, truth, frac, seed=0):

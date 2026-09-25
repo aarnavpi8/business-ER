@@ -1,133 +1,186 @@
 """Text normalisation for business names and addresses.
 
-Everything here is language-agnostic by design: the test set contains a
-country (France) that never appears in training, so we avoid rules that only
-make sense for US / India data and add multilingual legal-suffix and
-street-type vocabularies instead.
+Design rule: no rule is conditioned on the country label (the test set has an
+unseen country, France). Every dictionary below is applied to every record.
+
+Observed noise handled here (from the training data):
+  * Indic-script names (romanised via translit.py)
+  * spurious accents on English words ("Léarning"), casing, punctuation
+  * junk decoration: "-- ", "<< ", "[Center]", "###", "| www.site.com"
+  * website-style names ("wilfordhancock.com")
+  * legal suffixes anywhere in the name ("LLC Moncada ...", "Pvt. EFS ... Ltd.")
+  * address abbreviations (St/Street, R./Rue, AV/Avenue ...), full vs abbreviated
+    US state names, "CDP"/"City" suffixes, ordinals ("1st", "first"),
+    house-number noise ("01612", "14516d", "22459.")
 """
 import re
 import unicodedata
+from functools import lru_cache
 
-# Legal-form tokens that carry no identity information. Multilingual on purpose.
+from translit import romanize, has_indic
+
+# ----------------------------------------------------------------- vocab
 LEGAL_SUFFIXES = {
     # English / US / India
     "inc", "incorporated", "corp", "corporation", "co", "company", "companies",
-    "llc", "llp", "lp", "ltd", "limited", "plc", "pvt", "private", "pte",
-    "pllc", "pc", "na", "group", "holdings", "holding", "enterprises",
-    "enterprise", "the", "opc", "intl", "international",
+    "llc", "llp", "lp", "ltd", "limited", "plc", "pvt", "private", "pte", "pllc", "pc",
+    "the", "opc", "l", "c", "p", "pa",
     # French
-    "sarl", "sas", "sasu", "sa", "eurl", "sci", "snc", "scop", "scm", "selarl",
-    "earl", "gie", "cie", "et", "fils", "societe", "ets", "etablissements",
-    # German / other European forms that could plausibly appear
-    "gmbh", "ag", "kg", "bv", "nv", "srl", "spa", "sl", "oy", "ab", "as",
+    "sarl", "sas", "sasu", "sa", "eurl", "sci", "snc", "scop", "scm", "selarl", "earl",
+    "gie", "cie", "ste", "societe", "ets", "etablissements",
+    # other European forms
+    "gmbh", "ag", "kg", "bv", "nv", "srl", "spa", "sl", "oy", "ab",
+    # honorific / "M/s" prefixes common in Indian records
+    "mr", "mrs", "ms", "messrs", "shri_",
 }
+# long legal-form words: a token within typo distance of one of these is also dropped
+# (the data corrupts suffixes: "privoate", "prihate", "limitd", "corporatoin")
+_LONG_SUFFIXES = ("private", "limited", "company", "corporation", "incorporated", "enterprises_",
+                  "societe", "etablissements")
 
-# Abbreviation -> canonical token for addresses (applied token-wise).
+US_STATES = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar", "california": "ca",
+    "colorado": "co", "connecticut": "ct", "delaware": "de", "florida": "fl", "georgia": "ga",
+    "hawaii": "hi", "idaho": "id", "illinois": "il", "indiana": "in", "iowa": "ia",
+    "kansas": "ks", "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md",
+    "massachusetts": "ma", "michigan": "mi", "minnesota": "mn", "mississippi": "ms",
+    "missouri": "mo", "montana": "mt", "nebraska": "ne", "nevada": "nv", "new hampshire": "nh",
+    "new jersey": "nj", "new mexico": "nm", "new york": "ny", "north carolina": "nc",
+    "north dakota": "nd", "ohio": "oh", "oklahoma": "ok", "oregon": "or", "pennsylvania": "pa",
+    "rhode island": "ri", "south carolina": "sc", "south dakota": "sd", "tennessee": "tn",
+    "texas": "tx", "utah": "ut", "vermont": "vt", "virginia": "va", "washington": "wa",
+    "west virginia": "wv", "wisconsin": "wi", "wyoming": "wy", "district of columbia": "dc",
+}
+# multi-word state names must be replaced before tokenising
+_STATE_RE = re.compile(r"\b(" + "|".join(sorted((k for k in US_STATES if " " in k), key=len, reverse=True)) + r")\b")
+
 ADDR_ABBREV = {
-    "st": "street", "str": "street", "rd": "road", "ave": "avenue", "av": "avenue",
-    "avn": "avenue", "blvd": "boulevard", "bd": "boulevard", "bld": "boulevard",
-    "boul": "boulevard", "dr": "drive", "ln": "lane", "ct": "court",
-    "pl": "place", "pkwy": "parkway", "hwy": "highway", "sq": "square",
-    "ter": "terrace", "cir": "circle", "trl": "trail", "fwy": "freeway",
-    "expy": "expressway", "sr": "state route", "rte": "route", "rt": "route",
-    "ste": "suite", "apt": "apartment", "fl": "floor", "flr": "floor",
-    "bldg": "building", "n": "north", "s": "south", "e": "east", "w": "west",
-    "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest",
-    "mt": "mount", "ft": "fort", "jn": "junction", "jct": "junction",
-    "opp": "opposite", "nr": "near", "mkt": "market", "ngr": "nagar",
-    "clny": "colony", "sec": "sector", "sect": "sector", "ph": "phase",
-    "chk": "chowk", "mg": "mahatma gandhi",
-    # French street types
-    "r": "rue", "ch": "chemin", "che": "chemin", "rte.": "route", "imp": "impasse",
-    "all": "allee", "pce": "place", "fbg": "faubourg", "fg": "faubourg",
-    "crs": "cours", "qu": "quai", "qua": "quai", "sq.": "square",
-    "zi": "zone industrielle", "za": "zone artisanale", "zac": "zone activite",
-    "cedex": "",
+    "street": "st", "str": "st", "road": "rd", "avenue": "av", "ave": "av", "avn": "av",
+    "boulevard": "bd", "blvd": "bd", "bld": "bd", "boul": "bd", "drive": "dr", "lane": "ln",
+    "court": "ct", "place": "pl", "pce": "pl", "parkway": "pkwy", "highway": "hwy",
+    "square": "sq", "terrace": "ter", "circle": "cir", "trail": "trl", "freeway": "fwy",
+    "expressway": "expy", "route": "rte", "rt": "rte", "suite": "ste", "apartment": "apt",
+    "floor": "fl", "flr": "fl", "building": "bldg", "north": "n", "south": "s", "east": "e",
+    "west": "w", "northeast": "ne", "northwest": "nw", "southeast": "se", "southwest": "sw",
+    "mount": "mt", "fort": "ft", "junction": "jct", "jn": "jct", "opposite": "opp",
+    "near": "nr", "market": "mkt", "nagar": "ngr", "colony": "clny", "sector": "sec",
+    "sect": "sec", "phase": "ph", "chowk": "chk", "number": "no", "num": "no",
+    "saint": "st", "sainte": "ste", "post": "po",
+    # French street types -> short forms
+    "rue": "r", "chemin": "ch", "che": "ch", "impasse": "imp", "allee": "all",
+    "faubourg": "fbg", "fg": "fbg", "cours": "crs", "quai": "qu", "qua": "qu",
+    "route": "rte",
 }
+ADDR_DROP = {"cdp", "city", "of", "the", "de", "du", "des", "la", "le", "les", "d", "l",
+             "and", "cedex", "unit", "urban"}
+ORDINAL_WORDS = {"first": "1", "second": "2", "third": "3", "fourth": "4", "fifth": "5",
+                 "sixth": "6", "seventh": "7", "eighth": "8", "ninth": "9", "tenth": "10"}
 
-# Name-level abbreviations (after lowercasing, before suffix removal).
 NAME_ABBREV = {
-    "&": " and ", "+": " and ", "intl": "international", "mfg": "manufacturing",
-    "svcs": "services", "svc": "service", "srvs": "services", "tech": "technology",
-    "techs": "technologies", "sys": "systems", "mgmt": "management",
-    "assoc": "associates", "assocs": "associates", "bros": "brothers",
-    "dept": "department", "natl": "national", "univ": "university",
-    "hosp": "hospital", "ctr": "center", "centre": "center", "cntr": "center",
-    "mkt": "market", "pharma": "pharmaceuticals", "ind": "industries",
-    "inds": "industries", "st": "saint", "ste": "sainte",
+    "intl": "international", "mfg": "manufacturing", "svcs": "services", "svc": "service",
+    "srvs": "services", "techs": "technologies", "sys": "systems", "mgmt": "management",
+    "assoc": "associates", "assocs": "associates", "bros": "brothers", "dept": "department",
+    "natl": "national", "univ": "university", "hosp": "hospital", "ctr": "center",
+    "centre": "center", "cntr": "center", "ind": "industries", "inds": "industries",
+    "st": "saint", "ste": "sainte", "shri": "shree", "sri": "shree",
 }
 
+# ----------------------------------------------------------------- regexes
 _WS = re.compile(r"\s+")
 _NON_ALNUM = re.compile(r"[^0-9a-z ]+")
+_WEB = re.compile(r"\bwww\.|\.(?:com|net|org|in|co|fr|biz|info|us)\b")
+_ORD = re.compile(r"\b(\d+)(?:st|nd|rd|th|er|eme|e|re)\b")
+_NUM_SUFFIX = re.compile(r"\b0*(\d+)[a-z]\b")      # 14516d -> 14516 ; 12b stays 12
+_LEAD0 = re.compile(r"\b0+(\d)")
 _DIGITS = re.compile(r"\d+")
-_STE_SOCIETE = re.compile(r"(?i)(?<!\w)sté(?!\w)")
 
 
 def strip_accents(s: str) -> str:
-    """Remove diacritics (é -> e) so French / transliterated text compares cleanly."""
+    """Remove diacritics (é -> e); keeps base letters."""
     s = unicodedata.normalize("NFKD", s)
     return "".join(c for c in s if not unicodedata.combining(c))
 
 
 def basic_clean(s) -> str:
-    """Lowercase, strip accents, map '&' to 'and', drop punctuation, squeeze spaces."""
+    """Romanise Indic script, strip accents, lowercase, drop web decoration and punctuation."""
     if s is None or (isinstance(s, float) and s != s):
         return ""
-    s = strip_accents(str(s)).lower()
+    s = str(s)
+    if has_indic(s):
+        s = romanize(s)
+    s = strip_accents(s).lower()
+    s = _WEB.sub(" ", s)
     s = s.replace("&", " and ").replace("+", " and ").replace("@", " at ")
-    s = s.replace("'", "").replace("`", "")  # o'reilly -> oreilly
+    s = s.replace("'", "").replace("`", "").replace("’", "")
     s = _NON_ALNUM.sub(" ", s)
     return _WS.sub(" ", s).strip()
 
 
 def normalize_name(s) -> str:
-    """Canonical business name with abbreviations expanded (legal suffixes kept)."""
-    if isinstance(s, str):
-        # "Sté" (société) and "Ste" (sainte) collide once accents are stripped
-        s = _STE_SOCIETE.sub(" societe ", unicodedata.normalize("NFC", s))
-    toks = basic_clean(s).split()
-    out = []
-    for t in toks:
-        out.append(NAME_ABBREV.get(t, t))
-    return _WS.sub(" ", " ".join(out)).strip()
+    """Canonical business name: cleaned, abbreviations expanded, duplicate tokens removed."""
+    out, seen = [], set()
+    c = basic_clean(s)
+    if c.startswith("m s "):          # "M/s Tumkur Trading" (Indian "Messrs")
+        c = c[4:]
+    for t in c.split():
+        t = NAME_ABBREV.get(t, t)
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return " ".join(out)
+
+
+@lru_cache(maxsize=200_000)
+def _is_fuzzy_suffix(t: str) -> bool:
+    """True if token t looks like a typo of a long legal-form word (JW >= 0.88)."""
+    if len(t) < 5:
+        return False
+    from sims import jaro_winkler
+    return any(abs(len(t) - len(w)) <= 2 and jaro_winkler(t, w) >= 0.88 for w in _LONG_SUFFIXES)
 
 
 def core_name(norm_name: str) -> str:
-    """Name with legal-form tokens removed; falls back to the full name if empty."""
-    toks = [t for t in norm_name.split() if t not in LEGAL_SUFFIXES and t != "and"]
+    """Name without legal-form tokens (exact or typo'd) and 'and'; falls back to the full name."""
+    toks = [t for t in norm_name.split()
+            if t not in LEGAL_SUFFIXES and t != "and" and not _is_fuzzy_suffix(t)]
     return " ".join(toks) if toks else norm_name
 
 
 def name_acronym(core: str) -> str:
-    """First letters of the core-name tokens (e.g. 'state bank of india' -> 'sboi')."""
+    """First letters of core tokens ('sarah marketing' -> 'sm')."""
     return "".join(t[0] for t in core.split() if t)
 
 
 def normalize_address(s) -> str:
-    """Canonical address: abbreviations expanded, ordinals ('1st') split to digits."""
+    """Canonical address token string (order preserved, filler dropped)."""
     s = basic_clean(s)
-    s = re.sub(r"\b(\d+)(st|nd|rd|th|er|eme|e)\b", r"\1", s)  # 21st -> 21, 3eme -> 3
+    if not s:
+        return ""
+    s = _STATE_RE.sub(lambda m: US_STATES[m.group(1)], s)
+    s = _ORD.sub(r"\1", s)
+    s = _NUM_SUFFIX.sub(r"\1", s)
+    s = _LEAD0.sub(r"\1", s)
     toks = []
     for t in s.split():
-        rep = ADDR_ABBREV.get(t, t)
-        if rep:
-            toks.append(rep)
-    return _WS.sub(" ", " ".join(toks)).strip()
+        t = ORDINAL_WORDS.get(t, t)
+        t = US_STATES.get(t, t)
+        t = ADDR_ABBREV.get(t, t)
+        if t and t not in ADDR_DROP:
+            toks.append(t)
+    return " ".join(toks)
 
 
-def address_numbers(norm_addr: str) -> set:
-    """All digit groups in the address (house numbers, postcodes, suite numbers)."""
-    return set(_DIGITS.findall(norm_addr))
+def address_numbers(norm_addr: str) -> frozenset:
+    """All digit groups in the normalised address (house, unit, PO box, postcode)."""
+    return frozenset(_DIGITS.findall(norm_addr))
 
 
-def postcode(raw_addr) -> str:
-    """Best-effort postcode: a 5- or 6-digit group (US ZIP / French CP / Indian PIN).
+def first_number(norm_addr: str) -> str:
+    """First digit group (usually the house number); '' if none."""
+    m = _DIGITS.search(norm_addr)
+    return m.group(0) if m else ""
 
-    Also recognises Indian PINs written as '560 001'. Returns '' when absent.
-    """
-    if raw_addr is None or (isinstance(raw_addr, float) and raw_addr != raw_addr):
-        return ""
-    s = str(raw_addr)
-    s = re.sub(r"\b(\d{3})\s(\d{3})\b", r"\1\2", s)
-    m = re.findall(r"(?<!\d)(\d{5,6})(?!\d)", s)
-    return m[-1] if m else ""
+
+def address_words(norm_addr: str) -> str:
+    """Address with digits removed (street / locality words only)."""
+    return _WS.sub(" ", _DIGITS.sub(" ", norm_addr)).strip()

@@ -6,7 +6,8 @@ cosine similarity. Search is exact (brute force in chunks): on a laptop GPU a
 1M x 1M search at 256 dims takes a few minutes; on CPU it is slower but works.
 
 Encoders:
-  * "svd": char n-gram TF-IDF -> TruncatedSVD. No pretrained weights at all.
+  * "rp" : char n-gram TF-IDF -> Gaussian random projection (default; best recall).
+  * "svd": char n-gram TF-IDF -> TruncatedSVD (kept for comparison; loses rare n-grams).
   * "st:<model>": a sentence-transformers model, e.g.
         st:intfloat/multilingual-e5-small              (MIT)
         st:sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 (Apache-2.0)
@@ -14,6 +15,7 @@ Encoders:
     <= 8B params per the challenge rules.
 """
 import os
+import tempfile
 import numpy as np
 
 
@@ -69,6 +71,64 @@ def encode_svd(fit_texts, all_text_lists, dim=256, max_fit=150_000, seed=0):
     return out
 
 
+def _rp_worker_init(vec, R):
+    """R is the projection matrix or the path of a .npy copy (memory-mapped, so workers share it)."""
+    global _RP_VEC, _RP_R
+    _RP_VEC, _RP_R = vec, (np.load(R, mmap_mode="r") if isinstance(R, str) else R)
+
+
+def _rp_worker(texts):
+    # stored as float16: halves RAM (6M x 256 -> 3 GB) with ~1e-3 cosine error
+    return l2norm(np.asarray(_RP_VEC.transform(texts) @ _RP_R, np.float32)).astype(np.float16)
+
+
+def encode_rp(fit_texts, all_text_lists, dim=256, max_fit=1_000_000, seed=0, n_jobs=None):
+    """Char n-gram TF-IDF -> Gaussian random projection (L2-normalised).
+
+    Unlike SVD, a random projection preserves cosine similarity between the
+    full sparse TF-IDF vectors (error ~ 1/sqrt(dim)), including the rare
+    n-grams that actually identify a business. On a real-density regional
+    sample: recall@10 = 0.975 (dim 256) / 0.981 (dim 512) vs 0.988 exact and
+    0.902 for SVD-256. No pretrained weights; fitted per split/country.
+    """
+    import multiprocessing as mp
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    rng = np.random.default_rng(seed)
+    fit_texts = np.asarray(fit_texts, dtype=object)
+    if len(fit_texts) > max_fit:
+        fit_texts = fit_texts[rng.choice(len(fit_texts), max_fit, replace=False)]
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=2,
+                          max_features=400_000, sublinear_tf=True, dtype=np.float32)
+    vec.fit(fit_texts)
+    R = (rng.standard_normal((len(vec.vocabulary_), dim)) / np.sqrt(dim)).astype(np.float32)
+    # R is up to 400k x dim float32 (~400 MB): workers memory-map one on-disk copy instead of
+    # each unpickling their own, and the pool is capped because each worker also holds the vocabulary
+    n_jobs = n_jobs or min(8, max(1, (os.cpu_count() or 2) - 1))
+    lists = [np.asarray(t, dtype=object) for t in all_text_lists]
+    index = [(li, i) for li, t in enumerate(lists) for i in range(0, len(t), 100_000)]
+    chunks = [lists[li][i:i + 100_000] for li, i in index]
+    out = [np.empty((len(t), dim), np.float16) for t in lists]
+    if n_jobs > 1 and len(chunks) > 2:
+        fd, r_path = tempfile.mkstemp(suffix=".npy")
+        os.close(fd)
+        np.save(r_path, R)
+        del R
+        try:
+            with mp.get_context("spawn").Pool(min(n_jobs, len(chunks)), _rp_worker_init, (vec, r_path)) as pool:
+                for (li, i), res in zip(index, pool.imap(_rp_worker, chunks)):
+                    out[li][i:i + len(res)] = res
+        finally:
+            try:
+                os.remove(r_path)
+            except OSError:
+                pass
+    else:
+        _rp_worker_init(vec, R)
+        for (li, i), c in zip(index, chunks):
+            out[li][i:i + len(c)] = _rp_worker(c)
+    return out
+
+
 def encode_st(model_name, all_text_lists, batch_size=256):
     """Encode with a sentence-transformers model on the best available device."""
     from sentence_transformers import SentenceTransformer
@@ -88,6 +148,8 @@ def encode_st(model_name, all_text_lists, batch_size=256):
 
 def encode(kind, fit_texts, all_text_lists, dim=256):
     """Dispatch to the encoder named by `kind` ("svd" or "st:<model>")."""
+    if kind == "rp":
+        return encode_rp(fit_texts, all_text_lists, dim=dim)
     if kind == "svd":
         return encode_svd(fit_texts, all_text_lists, dim=dim)
     if kind.startswith("st:"):
@@ -95,29 +157,57 @@ def encode(kind, fit_texts, all_text_lists, dim=256):
     raise ValueError(kind)
 
 
-def _topk_torch(torch, dev, Q, D, k, chunk):
-    Dt = torch.from_numpy(D).to(dev)
-    if dev == "cuda":
-        Dt = Dt.half()
+def _topk_torch(torch, dev, Q, D, k, q_chunk=None, d_tile=None, mem_bytes=1.5e9):
+    """Exact top-k on GPU, tiled over queries and documents to bound memory.
+
+    D is uploaded once (fp16 on CUDA); each (query chunk x doc tile) similarity
+    block is at most ~mem_bytes; per-tile top-k results are merged on device.
+    """
+    half = dev == "cuda"
+    bpe = 2 if half else 4
+    Dt = torch.from_numpy(np.ascontiguousarray(D)).to(dev)
+    Dt = Dt.half() if half else Dt.float()
+    n_d = len(D)
+    d_tile = d_tile or min(n_d, 1_000_000)
+    q_chunk = q_chunk or max(64, int(mem_bytes // (d_tile * bpe)))
     idx_out = np.empty((len(Q), k), np.int64)
     sim_out = np.empty((len(Q), k), np.float32)
-    for st in range(0, len(Q), chunk):
-        q = torch.from_numpy(Q[st:st + chunk]).to(dev)
-        if dev == "cuda":
-            q = q.half()
-        s = q @ Dt.T
-        v, i = torch.topk(s, k, dim=1)
-        idx_out[st:st + chunk] = i.cpu().numpy()
-        sim_out[st:st + chunk] = v.float().cpu().numpy()
+    for st in range(0, len(Q), q_chunk):
+        q = torch.from_numpy(np.ascontiguousarray(Q[st:st + q_chunk])).to(dev)
+        q = q.half() if half else q.float()
+        best_v = best_i = None
+        for dt in range(0, n_d, d_tile):
+            s = q @ Dt[dt:dt + d_tile].T
+            kk = min(k, s.shape[1])
+            v, i = torch.topk(s, kk, dim=1)
+            i = i + dt
+            if best_v is None:
+                best_v, best_i = v, i
+            else:
+                cv = torch.cat([best_v, v], 1)
+                ci = torch.cat([best_i, i], 1)
+                v2, o = torch.topk(cv, min(k, cv.shape[1]), dim=1)
+                best_v, best_i = v2, torch.gather(ci, 1, o)
+            del s
+        kk = best_v.shape[1]
+        idx_out[st:st + q_chunk, :kk] = best_i.cpu().numpy()
+        sim_out[st:st + q_chunk, :kk] = best_v.float().cpu().numpy()
+        if kk < k:
+            idx_out[st:st + q_chunk, kk:] = -1
+            sim_out[st:st + q_chunk, kk:] = -1
+    del Dt
+    if dev == "cuda":
+        torch.cuda.empty_cache()
     return idx_out, sim_out
 
 
-def _topk_numpy(Q, D, k, budget=150_000_000):
+def _topk_numpy(Q, D, k, budget=40_000_000):
+    D = np.asarray(D, np.float32)
     rows = max(1, budget // max(len(D), 1))
     idx_out = np.empty((len(Q), k), np.int64)
     sim_out = np.empty((len(Q), k), np.float32)
     for st in range(0, len(Q), rows):
-        s = Q[st:st + rows] @ D.T
+        s = np.asarray(Q[st:st + rows], np.float32) @ D.T
         i = np.argpartition(-s, k - 1, axis=1)[:, :k]
         v = np.take_along_axis(s, i, axis=1)
         o = np.argsort(-v, axis=1)
@@ -145,7 +235,7 @@ def topk(Q, D, k, q_groups=None, d_groups=None, chunk=4096):
             continue
         kk = min(k, len(di))
         if torch is not None:
-            i, s = _topk_torch(torch, dev, Q[qi], D[di], kk, chunk)
+            i, s = _topk_torch(torch, dev, Q[qi], D[di], kk)
         else:
             i, s = _topk_numpy(Q[qi], D[di], kk)
         idx[qi, :kk] = di[i]
